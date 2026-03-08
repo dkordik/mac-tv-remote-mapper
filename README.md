@@ -1,4 +1,4 @@
-# cec-listener
+# mac-tv-remote-mapper
 
 Small Node.js service for listening to HDMI-CEC remote events on macOS and mapping them to local actions.
 
