@@ -168,12 +168,6 @@ function createCecMouseMapper(options = {}) {
       exitHoldTimer = null;
     }
 
-    if (!exitHoldTriggered) {
-      cycleStepMode();
-      if (onExitTap) {
-        onExitTap(currentStep());
-      }
-    }
     exitHoldTriggered = false;
   }
 
@@ -182,6 +176,8 @@ function createCecMouseMapper(options = {}) {
     handleKeyPressed,
     handleKeyReleased,
     clickCurrent,
+    cycleStepMode,
+    currentStep,
   };
 }
 

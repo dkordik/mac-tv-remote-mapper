@@ -15,6 +15,7 @@ const cecDebugLevel = process.env.CEC_DEBUG_LEVEL || '8';
 const cecDeviceType = process.env.CEC_DEVICE_TYPE || 'p';
 const monitorMode = !/^(0|false|no)$/i.test(process.env.CEC_MONITOR_MODE || '0');
 const cecHdmiPort = process.env.CEC_HDMI_PORT || '2';
+const selectHoldMs = Number(process.env.CEC_SELECT_HOLD_MS || '500');
 const autoClaimActiveSource = /^(1|true|yes)$/i.test(
   process.env.CEC_AUTO_CLAIM_ACTIVE_SOURCE || '0'
 );
@@ -40,6 +41,8 @@ let currentLogicalAddress = 0x08;
 let isLocalInputActive = true;
 let hasSeenLocalInputPath = false;
 let lastPressedKeyForRelease = '';
+let selectHoldTimer = null;
+let selectHoldTriggered = false;
 
 function parseMouseSteps(stepsValue) {
   const defaultSteps = [10, 80];
@@ -184,6 +187,16 @@ function onRemoteKeyPressed(keyName, context) {
 
   console.log('📺 key:', keyName);
   if (keyName === 'select') {
+    if (!selectHoldTimer) {
+      selectHoldTriggered = false;
+      selectHoldTimer = setTimeout(() => {
+        selectHoldTriggered = true;
+        mouseMapper.cycleStepMode();
+        mouseStepPx = mouseMapper.currentStep();
+        writeModeStateFile();
+        console.log(`📺 select hold -> mouse step ${mouseStepPx}px`);
+      }, selectHoldMs);
+    }
     return;
   }
 
@@ -224,8 +237,15 @@ function onRemoteKeyPressed(keyName, context) {
 function onRemoteKeyReleased(context) {
   const releasedKey = (context.keyName || '').toLowerCase();
   if (releasedKey === 'select') {
-    mouseMapper.clickCurrent();
-    console.log('📺 select tap -> click');
+    if (selectHoldTimer) {
+      clearTimeout(selectHoldTimer);
+      selectHoldTimer = null;
+    }
+    if (!selectHoldTriggered) {
+      mouseMapper.clickCurrent();
+      console.log('📺 select tap -> click');
+    }
+    selectHoldTriggered = false;
     return;
   }
 
@@ -477,6 +497,10 @@ function shutdown(signal, options = {}) {
   if (retryTimer) {
     clearTimeout(retryTimer);
     retryTimer = null;
+  }
+  if (selectHoldTimer) {
+    clearTimeout(selectHoldTimer);
+    selectHoldTimer = null;
   }
   stopModeMenuBar();
 

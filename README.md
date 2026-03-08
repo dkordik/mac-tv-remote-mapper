@@ -35,14 +35,22 @@ npm install
 
 ## Current key mappings
 
+### Remote -> Mouse
+
 - `select` tap -> mouse click
+- `select` hold (500ms) -> toggle mouse step size (`10 <-> 80`)
 - `enter` -> mouse click
 - `left`, `right`, `up`, `down` -> mouse move
+
+### Remote -> Keyboard
+
 - `channel_up` -> keyboard Up Arrow
 - `channel_down` -> keyboard Down Arrow
-- `exit` tap -> toggle mouse step size (`10 <-> 80`)
 - `exit` hold (500ms) -> send Escape key
 - `electronic_program_guide` -> press Enter key
+
+### Remote -> Media
+
 - `play`, `pause`, `stop` -> Spotify media control
 - `fast_forward`, `forward` -> Spotify next track
 - `rewind`, `backward` -> Spotify previous track
@@ -58,6 +66,7 @@ npm install
 - `CEC_MOUSE_STEPS=10,80` to set movement step sizes
 - `CEC_MOUSE_STEP_MODE=0` to choose initial mode index (0-based)
 - `CEC_EXIT_HOLD_MS=500` to set exit-button hold threshold
+- `CEC_SELECT_HOLD_MS=500` to set select-button hold threshold for step toggle
 - `CEC_KEYBOARD_ENABLED=1` to enable keyboard actions (Escape on hold)
 
 ## Menu bar mode icon
