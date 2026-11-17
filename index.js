@@ -13,6 +13,11 @@ const shutdownTimeoutMs = Number(process.env.CEC_SHUTDOWN_TIMEOUT_MS || 2000);
 const verbose = /^(1|true|yes)$/i.test(process.env.CEC_VERBOSE || '');
 const cecDebugLevel = process.env.CEC_DEBUG_LEVEL || '8';
 const cecDeviceType = process.env.CEC_DEVICE_TYPE || 'p';
+// Also register as a CEC Audio System (logical address 5) so the TV forwards its
+// volume up/down/mute buttons to us when its speaker output is set to "Audio System".
+const audioSystemEnabled = /^(1|true|yes)$/i.test(process.env.CEC_AUDIO_SYSTEM || '0');
+const CEC_AUDIO_SYSTEM_LA = 0x05;
+const volumeKeyNames = new Set(['volume_up', 'volume_down', 'mute']);
 const monitorMode = !/^(0|false|no)$/i.test(process.env.CEC_MONITOR_MODE || '0');
 const cecHdmiPort = process.env.CEC_HDMI_PORT || '2';
 const selectHoldMs = Number(process.env.CEC_SELECT_HOLD_MS || '500');
@@ -43,6 +48,13 @@ let hasSeenLocalInputPath = false;
 let lastPressedKeyForRelease = '';
 let selectHoldTimer = null;
 let selectHoldTriggered = false;
+let lastKnownActivePath = null;
+// Logical addresses this adapter has transmitted from (e.g. 4 = Playback, 5 = Audio).
+// The adapter sees every frame on the bus, so key frames addressed to other devices
+// (like the PS5) must be ignored rather than acted on.
+const ownLogicalAddresses = new Set();
+let lastVolumeKeyAt = 0;
+let lastVolumeKeyCode = -1;
 
 function parseMouseSteps(stepsValue) {
   const defaultSteps = [10, 80];
@@ -265,6 +277,45 @@ function sendActiveSource(reason) {
   }
 }
 
+// Broadcast <Report Physical Address> from the Audio System address right away, so the
+// TV doesn't wait for its next ~15s device poll to discover us and start System Audio Mode.
+function announceAudioSystem() {
+  if (!audioSystemEnabled || monitorMode || !cec || !cec.ready || configuredPhysicalAddress == null) {
+    return;
+  }
+  const hi = (configuredPhysicalAddress >> 8) & 0xff;
+  const lo = configuredPhysicalAddress & 0xff;
+  const header = (CEC_AUDIO_SYSTEM_LA << 4) | 0x0f;
+  transmitFrame([header, 0x84, hi, lo, CEC_AUDIO_SYSTEM_LA]);
+  console.log('🔊 announced audio system to TV');
+}
+
+// node-cec's sendCommand() writes "tx ..." without a trailing newline, so cec-client
+// never executes it. Write the command line ourselves.
+function transmitFrame(bytes) {
+  const frame = bytes.map((b) => (b & 0xff).toString(16).padStart(2, '0')).join(':');
+  cec.send(`tx ${frame}\n`);
+  if (verbose) {
+    console.log(`Transmitted: ${frame}`);
+  }
+}
+
+// Volume keys sent to the Audio System address arrive whatever input the TV is on,
+// so they skip the local-input gating and the shared press/release state.
+function onVolumeKeyPressed(keyName, keyCode) {
+  const now = Date.now();
+  if (keyCode === lastVolumeKeyCode && now - lastVolumeKeyAt < 60) {
+    return;
+  }
+  lastVolumeKeyCode = keyCode;
+  lastVolumeKeyAt = now;
+
+  const input =
+    lastKnownActivePath == null ? 'unknown' : formatPhysicalAddress(lastKnownActivePath);
+  const local = configuredPhysicalAddress != null && lastKnownActivePath === configuredPhysicalAddress;
+  console.log(`🔊 volume key: ${keyName} (input ${input}${local ? ', this Mac' : ''})`);
+}
+
 function maybeEmitRawKeyEvent(direction, keyCode, packetInfo) {
   const now = Date.now();
   const signature = `${direction}:${keyCode}:${packetInfo.source || ''}:${packetInfo.target || ''}`;
@@ -312,11 +363,44 @@ function parseRawFrameLine(line) {
     args,
   };
 
-  if ((opcode === CEC.Opcode.USER_CONTROL_PRESSED || opcode === 0x44) && args.length > 0) {
+  if (direction === '<<' && packetInfo.source !== 0x0f && !ownLogicalAddresses.has(packetInfo.source)) {
+    ownLogicalAddresses.add(packetInfo.source);
+    if (packetInfo.source !== CEC_AUDIO_SYSTEM_LA) {
+      currentLogicalAddress = packetInfo.source;
+    }
+    if (verbose) {
+      console.log(`Own logical addresses: ${[...ownLogicalAddresses].map((a) => a.toString(16)).join(', ')}`);
+    }
+  }
+
+  const isPress = (opcode === CEC.Opcode.USER_CONTROL_PRESSED || opcode === 0x44) && args.length > 0;
+  const isRelease = opcode === CEC.Opcode.USER_CONTROL_RELEASE || opcode === 0x45;
+  if (
+    (isPress || isRelease) &&
+    !monitorMode &&
+    [...ownLogicalAddresses].some((a) => a !== CEC_AUDIO_SYSTEM_LA) &&
+    !ownLogicalAddresses.has(packetInfo.target)
+  ) {
+    if (verbose) {
+      console.log(`Ignoring key frame for another device (LA ${packetInfo.target.toString(16)})`);
+    }
+    return;
+  }
+  if (audioSystemEnabled && packetInfo.target === CEC_AUDIO_SYSTEM_LA && (isPress || isRelease)) {
+    const keyName = isPress ? userControlCodeByValue[args[0]] || `unknown_${args[0]}` : '';
+    if (isPress && volumeKeyNames.has(keyName)) {
+      onVolumeKeyPressed(keyName, args[0]);
+    } else if (isPress) {
+      console.log(`🔊 audio-system key (unhandled): ${keyName}`);
+    }
+    return;
+  }
+
+  if (isPress) {
     // In monitor mode, key frames may be routed in different ways depending on TV behavior.
     // We intentionally avoid strict source/target filtering here and rely on active-input gating.
     maybeEmitRawKeyEvent('pressed', args[0], packetInfo);
-  } else if (opcode === CEC.Opcode.USER_CONTROL_RELEASE || opcode === 0x45) {
+  } else if (isRelease) {
     maybeEmitRawKeyEvent('released', CEC.UserControlCode.UNKNOWN, packetInfo);
   } else if ((opcode === CEC.Opcode.VENDOR_REMOTE_BUTTON_DOWN || opcode === 0x8a) && args.length > 0) {
     console.log('Vendor remote button down:', args[0]);
@@ -327,6 +411,7 @@ function parseRawFrameLine(line) {
   } else if ((opcode === CEC.Opcode.ROUTING_CHANGE || opcode === 0x80) && args.length >= 4) {
     const fromPath = (args[0] << 8) | args[1];
     const toPath = (args[2] << 8) | args[3];
+    lastKnownActivePath = toPath;
     if (configuredPhysicalAddress != null && toPath === configuredPhysicalAddress) {
       hasSeenLocalInputPath = true;
       isLocalInputActive = true;
@@ -341,6 +426,7 @@ function parseRawFrameLine(line) {
     }
   } else if ((opcode === CEC.Opcode.ROUTING_INFORMATION || opcode === 0x81) && args.length >= 2) {
     const path = (args[0] << 8) | args[1];
+    lastKnownActivePath = path;
     if (configuredPhysicalAddress != null && path === configuredPhysicalAddress) {
       hasSeenLocalInputPath = true;
       isLocalInputActive = true;
@@ -348,8 +434,19 @@ function parseRawFrameLine(line) {
       isLocalInputActive = false;
     }
     console.log(`📺 routing info: active path ${formatPhysicalAddress(path)}`);
+  } else if (opcode === 0x86 && args.length >= 2) {
+    // <Set Stream Path>: the TV announcing which input it switched to.
+    lastKnownActivePath = (args[0] << 8) | args[1];
+    if (configuredPhysicalAddress != null && lastKnownActivePath === configuredPhysicalAddress) {
+      hasSeenLocalInputPath = true;
+      isLocalInputActive = true;
+    } else if (hasSeenLocalInputPath) {
+      isLocalInputActive = false;
+    }
+    console.log(`📺 TV switched input: ${formatPhysicalAddress(lastKnownActivePath)}`);
   } else if ((opcode === CEC.Opcode.ACTIVE_SOURCE || opcode === 0x82) && args.length >= 2) {
     const path = (args[0] << 8) | args[1];
+    lastKnownActivePath = path;
     if (configuredPhysicalAddress != null && path === configuredPhysicalAddress) {
       hasSeenLocalInputPath = true;
       isLocalInputActive = true;
@@ -375,10 +472,14 @@ function scheduleRestart(reason) {
 function startCec() {
   cec = new NodeCec(cecOsdName);
   cec.ready = false;
+  ownLogicalAddresses.clear();
+  if (audioSystemEnabled && !monitorMode) {
+    ownLogicalAddresses.add(CEC_AUDIO_SYSTEM_LA);
+  }
 
   if (verbose) {
     console.log(
-      `Starting CEC with bin=${cecClientBin}, debug=${cecDebugLevel}, deviceType=${cecDeviceType}, monitorMode=${monitorMode}, hdmiPort=${cecHdmiPort || 'auto'}`
+      `Starting CEC with bin=${cecClientBin}, debug=${cecDebugLevel}, deviceType=${cecDeviceType}, audioSystem=${audioSystemEnabled}, monitorMode=${monitorMode}, hdmiPort=${cecHdmiPort || 'auto'}`
     );
     console.log(`Using OSD name: ${cecOsdName}`);
   }
@@ -389,6 +490,7 @@ function startCec() {
     isLocalInputActive = true;
     hasSeenLocalInputPath = false;
     sendActiveSource('ready');
+    announceAudioSystem();
   });
 
   if (useNodeEvents) {
@@ -455,6 +557,10 @@ function startCec() {
   });
 
   const args = ['-d', cecDebugLevel, '-t', cecDeviceType];
+  // cec-client needs a separate -t per type ("-t pa" is misparsed as a recorder).
+  if (audioSystemEnabled && !monitorMode && cecDeviceType !== 'a') {
+    args.push('-t', 'a');
+  }
   if (monitorMode) {
     args.unshift('-m');
   }

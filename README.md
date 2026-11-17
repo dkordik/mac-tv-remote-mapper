@@ -56,9 +56,12 @@ npm install
 
 ## Useful env vars
 
+Set these in the environment, or put `KEY=value` lines in a git-ignored `.env.local` next to `start.sh`. It is re-read on every (re)launch, so edit it and run `./restart.sh` to apply. Output is also appended to `/tmp/cec-listener.log`.
+
 - `CEC_VERBOSE=1` for verbose CEC logs
 - `CEC_HDMI_PORT=2` to force HDMI port
 - `CEC_MONITOR_MODE=0` runs as active client mode (default)
+- `CEC_AUDIO_SYSTEM=1` also registers as a CEC Audio System (logical address 5) so the TV forwards its volume up/down/mute buttons; they are logged as `🔊 volume key` on any input (experimental)
 - `CEC_AUTO_CLAIM_ACTIVE_SOURCE=0` keeps this listener from stealing active input (default)
 - `CEC_MEDIA_PLAYER=Spotify` to choose media app target
 - `CEC_MOUSE_ENABLED=0` to disable mouse mapping

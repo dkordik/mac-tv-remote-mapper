@@ -8,6 +8,10 @@ cd "$(dirname "$0")"
 # Prevent multiple instances from competing for the single CEC serial device.
 pid_file="/tmp/cec-listener.pid"
 supervisor_pid_file="/tmp/cec-listener-supervisor.pid"
+# Optional, git-ignored KEY=value settings (e.g. CEC_AUDIO_SYSTEM=1). Re-read on every
+# (re)launch, so edit it and run ./restart.sh to apply without retyping env vars.
+env_file="${CEC_ENV_FILE:-.env.local}"
+log_file="${CEC_LOG_FILE:-/tmp/cec-listener.log}"
 
 if [[ -f "$supervisor_pid_file" ]]; then
   existing_pid="$(cat "$supervisor_pid_file" 2>/dev/null || true)"
@@ -64,7 +68,20 @@ trap 'cleanup' EXIT
 
 while true; do
   restart_requested=0
-  node index.js &
+  echo "=== cec-listener starting $(date '+%Y-%m-%d %H:%M:%S') ===" | tee -a "$log_file"
+  if [[ -f "$env_file" ]]; then
+    echo "Using settings from $env_file: $(grep -E '^[A-Za-z_]+=' "$env_file" | tr '\n' ' ')" | tee -a "$log_file"
+  fi
+  # Subshell keeps env-file values from leaking between restarts; exec keeps node's pid as $!.
+  (
+    set -a
+    if [[ -f "$env_file" ]]; then
+      # shellcheck disable=SC1090
+      source "$env_file"
+    fi
+    set +a
+    exec node index.js
+  ) > >(tee -a "$log_file") 2>&1 &
   child_pid="$!"
   echo "$child_pid" > "$pid_file"
 
