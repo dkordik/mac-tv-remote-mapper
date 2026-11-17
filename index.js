@@ -369,6 +369,54 @@ function announceAudioSystem() {
   console.log('🔊 announced audio system to TV');
 }
 
+// Debug aid: with CEC_DEBUG_TX_FIFO=/tmp/cec-listener.tx, each line written to that named
+// pipe (e.g. `echo 50:7a:15 > /tmp/cec-listener.tx`) is transmitted as a CEC frame.
+const debugTxFifo = process.env.CEC_DEBUG_TX_FIFO || '';
+let debugTxStream = null;
+
+function startDebugTxFifo() {
+  if (!debugTxFifo || debugTxStream || shuttingDown) {
+    return;
+  }
+  try {
+    if (!fs.existsSync(debugTxFifo)) {
+      require('child_process').execFileSync('mkfifo', [debugTxFifo]);
+    }
+  } catch (err) {
+    console.error(`Debug TX FIFO unavailable: ${err.message}`);
+    return;
+  }
+
+  let buffer = '';
+  debugTxStream = fs.createReadStream(debugTxFifo, { encoding: 'utf8' });
+  debugTxStream.on('data', (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      const frame = line.trim().replace(/^tx\s+/i, '');
+      if (!/^[0-9a-f]{2}(:[0-9a-f]{2})*$/i.test(frame)) {
+        if (frame) console.error(`Debug TX ignored: ${line}`);
+        continue;
+      }
+      if (cec && cec.ready) {
+        console.log(`🧪 debug tx ${frame}`);
+        transmitFrame(frame.split(':').map((h) => parseInt(h, 16)));
+      }
+    }
+  });
+  // Each writer closing ends the stream; reopen for the next one.
+  const reopen = () => {
+    debugTxStream = null;
+    setTimeout(startDebugTxFifo, 100);
+  };
+  debugTxStream.on('end', reopen);
+  debugTxStream.on('error', (err) => {
+    console.error(`Debug TX FIFO error: ${err.message}`);
+    reopen();
+  });
+}
+
 // node-cec's sendCommand() writes "tx ..." without a trailing newline, so cec-client
 // never executes it. Write the command line ourselves.
 function transmitFrame(bytes) {
@@ -602,6 +650,7 @@ function startCec() {
     sendActiveSource('ready');
     announceAudioSystem();
     receiverStatus.start();
+    startDebugTxFifo();
   });
 
   if (useNodeEvents) {
