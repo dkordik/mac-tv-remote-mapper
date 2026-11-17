@@ -6,6 +6,7 @@ const { spawn } = require('child_process');
 const { createCecMouseMapper } = require('./cec-mouse-mapper');
 const { createCecMediaMapper } = require('./cec-media-mapper');
 const { createCecKeyboardMapper } = require('./cec-keyboard-mapper');
+const { createReceiverStatus, describeAudioStatus } = require('./receiver-status');
 
 const cecClientBin = process.env.CEC_CLIENT_BIN || 'cec-client';
 const retryDelayMs = Number(process.env.CEC_RETRY_MS || 3000);
@@ -18,6 +19,8 @@ const cecDeviceType = process.env.CEC_DEVICE_TYPE || 'p';
 const audioSystemEnabled = /^(1|true|yes)$/i.test(process.env.CEC_AUDIO_SYSTEM || '0');
 const CEC_AUDIO_SYSTEM_LA = 0x05;
 const volumeKeyNames = new Set(['volume_up', 'volume_down', 'mute']);
+// Receiver volume reported to the TV (ymc-500-remote service). Set CEC_RECEIVER_URL= to disable.
+const receiverUrl = process.env.CEC_RECEIVER_URL ?? 'http://127.0.0.1:8732';
 const monitorMode = !/^(0|false|no)$/i.test(process.env.CEC_MONITOR_MODE || '0');
 const cecHdmiPort = process.env.CEC_HDMI_PORT || '2';
 const selectHoldMs = Number(process.env.CEC_SELECT_HOLD_MS || '500');
@@ -49,6 +52,14 @@ let lastPressedKeyForRelease = '';
 let selectHoldTimer = null;
 let selectHoldTriggered = false;
 let lastKnownActivePath = null;
+// When the user picks another input, the TV polls that device's power status every ~2s
+// for up to ~10s before announcing the switch, and meanwhile keeps sending remote keys
+// to us. Rapid repeated polls of one device are our early sign the TV is switching away.
+const SWITCH_POLL_WINDOW_MS = 3500;
+const SWITCH_FAILSAFE_MS = 15000;
+const releaseOnSwitch = /^(1|true|yes)$/i.test(process.env.CEC_RELEASE_ON_SWITCH || '0');
+const lastPowerPollAt = {};
+let suspectedSwitchAt = 0;
 // Logical addresses this adapter has transmitted from (e.g. 4 = Playback, 5 = Audio).
 // The adapter sees every frame on the bus, so key frames addressed to other devices
 // (like the PS5) must be ignored rather than acted on.
@@ -181,7 +192,38 @@ const mediaMapper = createCecMediaMapper({
   player: process.env.CEC_MEDIA_PLAYER || 'Spotify',
 });
 
+const receiverStatus = createReceiverStatus({
+  baseUrl: audioSystemEnabled ? receiverUrl : '',
+  volumeMax: process.env.CEC_RECEIVER_VOLUME_MAX || '100',
+  pollMs: process.env.CEC_RECEIVER_POLL_MS || '5000',
+  verbose,
+  onChange: (byte) => {
+    console.log(`🔊 receiver volume: ${describeAudioStatus(byte)}`);
+    reportAudioStatus(0x00);
+  },
+});
+
+// <Report Audio Status> from our Audio System address. libCEC also answers the TV's
+// <Give Audio Status> itself with 0x7F (unknown); this follow-up carries the real value.
+function reportAudioStatus(destination) {
+  if (!audioSystemEnabled || monitorMode || !cec || !cec.ready) {
+    return;
+  }
+  transmitFrame([(CEC_AUDIO_SYSTEM_LA << 4) | (destination & 0x0f), 0x7a, receiverStatus.currentCecByte()]);
+}
+
 function onRemoteKeyPressed(keyName, context) {
+  // If a suspected switch away was never confirmed, the TV is still on us: stop ignoring keys.
+  if (
+    suspectedSwitchAt &&
+    Date.now() - suspectedSwitchAt > SWITCH_FAILSAFE_MS &&
+    lastKnownActivePath === configuredPhysicalAddress
+  ) {
+    suspectedSwitchAt = 0;
+    isLocalInputActive = true;
+    console.log('📺 suspected input switch not confirmed; handling keys again');
+  }
+
   // Fail-open until we have confidently observed the local HDMI path at least once.
   if (hasSeenLocalInputPath && !isLocalInputActive) {
     if (verbose) {
@@ -277,6 +319,41 @@ function sendActiveSource(reason) {
   }
 }
 
+function noteActivePath(path) {
+  lastKnownActivePath = path;
+  suspectedSwitchAt = 0;
+}
+
+function noteTvPowerPoll(targetLa) {
+  const now = Date.now();
+  const previous = lastPowerPollAt[targetLa] || 0;
+  lastPowerPollAt[targetLa] = now;
+  if (now - previous <= SWITCH_POLL_WINDOW_MS) {
+    markSuspectedSwitch(targetLa, 'repeated power polls');
+  }
+}
+
+// The TV is (probably) moving remote focus to another device before it announces the
+// switch: stop acting on keys still addressed to us until the input is confirmed.
+function markSuspectedSwitch(targetLa, reason) {
+  if (suspectedSwitchAt || !isLocalInputActive) {
+    return;
+  }
+
+  suspectedSwitchAt = Date.now();
+  hasSeenLocalInputPath = true;
+  isLocalInputActive = false;
+  console.log(`📺 TV appears to be switching to LA ${targetLa.toString(16)} (${reason}); ignoring remote keys`);
+
+  if (releaseOnSwitch && cec && cec.ready && configuredPhysicalAddress != null) {
+    const hi = (configuredPhysicalAddress >> 8) & 0xff;
+    const lo = configuredPhysicalAddress & 0xff;
+    // <Inactive Source> from our playback address, so the TV stops treating us as the source.
+    transmitFrame([(currentLogicalAddress << 4) | 0x00, 0x9d, hi, lo]);
+    console.log('📺 sent Inactive Source');
+  }
+}
+
 // Broadcast <Report Physical Address> from the Audio System address right away, so the
 // TV doesn't wait for its next ~15s device poll to discover us and start System Audio Mode.
 function announceAudioSystem() {
@@ -314,6 +391,9 @@ function onVolumeKeyPressed(keyName, keyCode) {
     lastKnownActivePath == null ? 'unknown' : formatPhysicalAddress(lastKnownActivePath);
   const local = configuredPhysicalAddress != null && lastKnownActivePath === configuredPhysicalAddress;
   console.log(`🔊 volume key: ${keyName} (input ${input}${local ? ', this Mac' : ''})`);
+  // A real audio system answers each volume press with its new status; the TV may only
+  // show its volume display in response to a press.
+  reportAudioStatus(0x00);
 }
 
 function maybeEmitRawKeyEvent(direction, keyCode, packetInfo) {
@@ -373,6 +453,25 @@ function parseRawFrameLine(line) {
     }
   }
 
+  if (
+    audioSystemEnabled &&
+    direction === '>>' &&
+    opcode === 0x71 &&
+    packetInfo.target === CEC_AUDIO_SYSTEM_LA
+  ) {
+    reportAudioStatus(packetInfo.source);
+  }
+
+  if (
+    direction === '>>' &&
+    opcode === 0x8f &&
+    packetInfo.source === 0x00 &&
+    packetInfo.target !== 0x0f &&
+    !ownLogicalAddresses.has(packetInfo.target)
+  ) {
+    noteTvPowerPoll(packetInfo.target);
+  }
+
   const isPress = (opcode === CEC.Opcode.USER_CONTROL_PRESSED || opcode === 0x44) && args.length > 0;
   const isRelease = opcode === CEC.Opcode.USER_CONTROL_RELEASE || opcode === 0x45;
   if (
@@ -383,6 +482,11 @@ function parseRawFrameLine(line) {
   ) {
     if (verbose) {
       console.log(`Ignoring key frame for another device (LA ${packetInfo.target.toString(16)})`);
+    }
+    // The TV sending remote keys elsewhere (e.g. power-on to wake the PS5) means the
+    // remote's focus has left us, even if the input switch isn't announced yet.
+    if (isPress && packetInfo.source === 0x00 && packetInfo.target !== 0x0f) {
+      markSuspectedSwitch(packetInfo.target, `TV sent key ${args[0].toString(16)}`);
     }
     return;
   }
@@ -411,7 +515,7 @@ function parseRawFrameLine(line) {
   } else if ((opcode === CEC.Opcode.ROUTING_CHANGE || opcode === 0x80) && args.length >= 4) {
     const fromPath = (args[0] << 8) | args[1];
     const toPath = (args[2] << 8) | args[3];
-    lastKnownActivePath = toPath;
+    noteActivePath(toPath);
     if (configuredPhysicalAddress != null && toPath === configuredPhysicalAddress) {
       hasSeenLocalInputPath = true;
       isLocalInputActive = true;
@@ -426,7 +530,7 @@ function parseRawFrameLine(line) {
     }
   } else if ((opcode === CEC.Opcode.ROUTING_INFORMATION || opcode === 0x81) && args.length >= 2) {
     const path = (args[0] << 8) | args[1];
-    lastKnownActivePath = path;
+    noteActivePath(path);
     if (configuredPhysicalAddress != null && path === configuredPhysicalAddress) {
       hasSeenLocalInputPath = true;
       isLocalInputActive = true;
@@ -436,7 +540,7 @@ function parseRawFrameLine(line) {
     console.log(`📺 routing info: active path ${formatPhysicalAddress(path)}`);
   } else if (opcode === 0x86 && args.length >= 2) {
     // <Set Stream Path>: the TV announcing which input it switched to.
-    lastKnownActivePath = (args[0] << 8) | args[1];
+    noteActivePath((args[0] << 8) | args[1]);
     if (configuredPhysicalAddress != null && lastKnownActivePath === configuredPhysicalAddress) {
       hasSeenLocalInputPath = true;
       isLocalInputActive = true;
@@ -446,7 +550,7 @@ function parseRawFrameLine(line) {
     console.log(`📺 TV switched input: ${formatPhysicalAddress(lastKnownActivePath)}`);
   } else if ((opcode === CEC.Opcode.ACTIVE_SOURCE || opcode === 0x82) && args.length >= 2) {
     const path = (args[0] << 8) | args[1];
-    lastKnownActivePath = path;
+    noteActivePath(path);
     if (configuredPhysicalAddress != null && path === configuredPhysicalAddress) {
       hasSeenLocalInputPath = true;
       isLocalInputActive = true;
@@ -491,6 +595,7 @@ function startCec() {
     hasSeenLocalInputPath = false;
     sendActiveSource('ready');
     announceAudioSystem();
+    receiverStatus.start();
   });
 
   if (useNodeEvents) {
@@ -604,6 +709,7 @@ function shutdown(signal, options = {}) {
     selectHoldTimer = null;
   }
   stopModeMenuBar();
+  receiverStatus.stop();
 
   console.log(`\nShutting down CEC listener (${signal})...`);
 

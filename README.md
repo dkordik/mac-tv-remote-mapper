@@ -62,6 +62,8 @@ Set these in the environment, or put `KEY=value` lines in a git-ignored `.env.lo
 - `CEC_HDMI_PORT=2` to force HDMI port
 - `CEC_MONITOR_MODE=0` runs as active client mode (default)
 - `CEC_AUDIO_SYSTEM=1` also registers as a CEC Audio System (logical address 5) so the TV forwards its volume up/down/mute buttons; they are logged as `🔊 volume key` on any input (experimental)
+  - `CEC_RECEIVER_URL=http://127.0.0.1:8732` (default) reports the receiver volume from the ymc-500-remote service to the TV; set it empty to disable. `CEC_RECEIVER_VOLUME_MAX=100`, `CEC_RECEIVER_POLL_MS=5000`
+- `CEC_RELEASE_ON_SWITCH=1` sends Inactive Source when the TV appears to be switching to another device (experimental)
 - `CEC_AUTO_CLAIM_ACTIVE_SOURCE=0` keeps this listener from stealing active input (default)
 - `CEC_MEDIA_PLAYER=Spotify` to choose media app target
 - `CEC_MOUSE_ENABLED=0` to disable mouse mapping
