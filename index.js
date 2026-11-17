@@ -21,6 +21,8 @@ const CEC_AUDIO_SYSTEM_LA = 0x05;
 const volumeKeyNames = new Set(['volume_up', 'volume_down', 'mute']);
 // Receiver volume reported to the TV (ymc-500-remote service). Set CEC_RECEIVER_URL= to disable.
 const receiverUrl = process.env.CEC_RECEIVER_URL ?? 'http://127.0.0.1:8732';
+// Forward TV volume up/down/mute presses to the receiver. Set CEC_RECEIVER_CONTROL=0 to only log them.
+const receiverControlEnabled = !/^(0|false|no)$/i.test(process.env.CEC_RECEIVER_CONTROL || '1');
 const monitorMode = !/^(0|false|no)$/i.test(process.env.CEC_MONITOR_MODE || '0');
 const cecHdmiPort = process.env.CEC_HDMI_PORT || '2';
 const selectHoldMs = Number(process.env.CEC_SELECT_HOLD_MS || '500');
@@ -195,7 +197,7 @@ const mediaMapper = createCecMediaMapper({
 const receiverStatus = createReceiverStatus({
   baseUrl: audioSystemEnabled ? receiverUrl : '',
   volumeMax: process.env.CEC_RECEIVER_VOLUME_MAX || '100',
-  pollMs: process.env.CEC_RECEIVER_POLL_MS || '5000',
+  pollMs: process.env.CEC_RECEIVER_POLL_MS || '5000', // fallback while the event stream is down
   verbose,
   onChange: (byte) => {
     console.log(`🔊 receiver volume: ${describeAudioStatus(byte)}`);
@@ -390,9 +392,13 @@ function onVolumeKeyPressed(keyName, keyCode) {
   const input =
     lastKnownActivePath == null ? 'unknown' : formatPhysicalAddress(lastKnownActivePath);
   const local = configuredPhysicalAddress != null && lastKnownActivePath === configuredPhysicalAddress;
-  console.log(`🔊 volume key: ${keyName} (input ${input}${local ? ', this Mac' : ''})`);
-  // A real audio system answers each volume press with its new status; the TV may only
-  // show its volume display in response to a press.
+  const sent = receiverControlEnabled && receiverStatus.sendRemoteKey(keyName);
+  console.log(
+    `🔊 volume key: ${keyName} (input ${input}${local ? ', this Mac' : ''})${sent ? ' -> receiver' : ''}`
+  );
+  // A real audio system answers each volume press with its status; the Sony only shows
+  // its volume display in reply to a press. This carries the current level; the new one
+  // follows from the receiver's event stream (see onChange).
   reportAudioStatus(0x00);
 }
 

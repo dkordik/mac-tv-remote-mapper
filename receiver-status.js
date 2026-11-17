@@ -1,9 +1,20 @@
-// Polls the ymc-500-remote service for the receiver's volume/mute and caches it, so the
-// CEC audio system can answer the TV's <Give Audio Status> instantly. The service reports
-// its believed state (it can't read the receiver), so values drift if the receiver is
-// changed outside the service, e.g. with its own remote or knob.
+// Client for the ymc-500-remote service, which drives the receiver and tracks its
+// volume/mute. That service is the source of truth: we display what it reports, send it
+// one key request per remote press, and never keep our own volume model or retry presses.
+//
+// Status comes from its /receiver/events Server-Sent Events stream; while the stream is
+// down we fall back to polling /receiver/status. The latest value is cached so the CEC
+// audio system can answer the TV instantly.
+
+const http = require('http');
+const https = require('https');
 
 const UNKNOWN_AUDIO_STATUS = 0x7f;
+const RECEIVER_KEYS = {
+  volume_up: 'vol+',
+  volume_down: 'vol-',
+  mute: 'mute',
+};
 
 function createReceiverStatus(options = {}) {
   const baseUrl = (options.baseUrl || '').replace(/\/+$/, '');
@@ -14,7 +25,12 @@ function createReceiverStatus(options = {}) {
   const onChange = typeof options.onChange === 'function' ? options.onChange : () => {};
 
   let cecByte = UNKNOWN_AUDIO_STATUS;
-  let timer = null;
+  let stopped = true;
+  let pollTimer = null;
+  let reconnectTimer = null;
+  let reconnectMs = 2000;
+  let eventsRequest = null;
+  let streamConnected = false;
   let inFlight = false;
   let lastError = '';
 
@@ -27,27 +43,24 @@ function createReceiverStatus(options = {}) {
     return (status.muted ? 0x80 : 0) | percent;
   }
 
-  // A reused keep-alive connection can be closed by the server just as we send on it
-  // (Node servers drop idle sockets after 5s), so retry once on a network-level failure.
-  async function fetchStatus() {
-    const url = `${baseUrl}/receiver/status`;
-    try {
-      return await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-    } catch (err) {
-      if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-        throw err;
-      }
-      if (verbose) {
-        console.log(`Receiver status: retrying after ${describeError(err)}`);
-      }
-      return fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  function applyStatus(status) {
+    const next = toCecByte(status);
+    if (next !== cecByte) {
+      cecByte = next;
+      onChange(cecByte);
     }
   }
 
-  function describeError(err) {
+  function logErrorOnce(context, err) {
     const cause = err && err.cause ? err.cause.code || err.cause.message : '';
-    return cause ? `${err.message} (${cause})` : String(err && err.message);
+    const message = `${context}: ${err && err.message}${cause ? ` (${cause})` : ''}`;
+    if (verbose && message !== lastError) {
+      console.error(`Receiver ${message}`);
+    }
+    lastError = message;
   }
+
+  // --- Fallback polling (only while the event stream is down) ---
 
   async function refresh() {
     if (!baseUrl || inFlight) {
@@ -55,49 +68,182 @@ function createReceiverStatus(options = {}) {
     }
     inFlight = true;
     try {
-      const res = await fetchStatus();
+      const res = await fetch(`${baseUrl}/receiver/status`, { signal: AbortSignal.timeout(timeoutMs) });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
-      const next = toCecByte(await res.json());
-      lastError = '';
-      if (next !== cecByte) {
-        cecByte = next;
-        onChange(cecByte);
-      }
+      applyStatus(await res.json());
     } catch (err) {
-      // Keep the last known value; log each distinct failure once.
-      const message = describeError(err);
-      if (verbose && message !== lastError) {
-        console.error(`Receiver status unavailable: ${message}`);
-      }
-      lastError = message;
+      // Keep the last known value.
+      logErrorOnce('status unavailable', err);
     } finally {
       inFlight = false;
     }
   }
 
-  function start() {
-    if (!baseUrl || timer) {
+  function startPolling() {
+    if (pollTimer || stopped) {
       return;
     }
     refresh();
-    timer = setInterval(refresh, pollMs);
-    timer.unref();
+    pollTimer = setInterval(refresh, pollMs);
+    pollTimer.unref();
+  }
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  // --- Event stream ---
+
+  function scheduleReconnect() {
+    streamConnected = false;
+    eventsRequest = null;
+    if (stopped || reconnectTimer) {
+      return;
+    }
+    startPolling();
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connectEvents();
+    }, reconnectMs);
+    reconnectTimer.unref();
+  }
+
+  function handleEvent(eventName, data) {
+    if (eventName !== 'status' || !data) {
+      return;
+    }
+    try {
+      applyStatus(JSON.parse(data));
+    } catch (err) {
+      logErrorOnce('bad status event', err);
+    }
+  }
+
+  function connectEvents() {
+    if (stopped || eventsRequest) {
+      return;
+    }
+    const url = new URL(`${baseUrl}/receiver/events`);
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.get(url, { headers: { Accept: 'text/event-stream' } }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        logErrorOnce('events unavailable', new Error(`HTTP ${res.statusCode}`));
+        scheduleReconnect();
+        return;
+      }
+
+      streamConnected = true;
+      lastError = '';
+      stopPolling();
+      if (verbose) {
+        console.log('Receiver event stream connected');
+      }
+
+      res.setEncoding('utf8');
+      let buffer = '';
+      let eventName = 'message';
+      let dataLines = [];
+      res.on('data', (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, newline).replace(/\r$/, '');
+          buffer = buffer.slice(newline + 1);
+          if (line === '') {
+            handleEvent(eventName, dataLines.join('\n'));
+            eventName = 'message';
+            dataLines = [];
+          } else if (line.startsWith(':')) {
+            // Keep-alive comment.
+          } else if (line.startsWith('event:')) {
+            eventName = line.slice(6).trim();
+          } else if (line.startsWith('data:')) {
+            dataLines.push(line.slice(5).replace(/^ /, ''));
+          } else if (line.startsWith('retry:')) {
+            const retry = Number(line.slice(6).trim());
+            if (retry > 0) {
+              reconnectMs = retry;
+            }
+          }
+        }
+      });
+      res.on('end', () => {
+        logErrorOnce('event stream ended', new Error('server closed the stream'));
+        scheduleReconnect();
+      });
+      res.on('error', (err) => {
+        logErrorOnce('event stream error', err);
+        scheduleReconnect();
+      });
+    });
+    req.on('error', (err) => {
+      logErrorOnce('events unavailable', err);
+      scheduleReconnect();
+    });
+    eventsRequest = req;
+  }
+
+  // --- Commands ---
+
+  // One request per remote press, fire and forget. The service queues and paces presses,
+  // so this must never be retried: a retry would double the press.
+  function sendRemoteKey(keyName) {
+    const key = RECEIVER_KEYS[keyName];
+    if (!baseUrl || !key) {
+      return false;
+    }
+    fetch(`${baseUrl}/receiver/key`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ key }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.text().catch(() => '');
+          console.error(`Receiver key ${key} rejected: HTTP ${res.status} ${body}`);
+        }
+      })
+      .catch((err) => {
+        console.error(`Receiver key ${key} failed: ${err.message}`);
+      });
+    return true;
+  }
+
+  function start() {
+    if (!baseUrl || !stopped) {
+      return;
+    }
+    stopped = false;
+    connectEvents();
   }
 
   function stop() {
-    if (timer) {
-      clearInterval(timer);
-      timer = null;
+    stopped = true;
+    stopPolling();
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
     }
+    if (eventsRequest) {
+      eventsRequest.destroy();
+      eventsRequest = null;
+    }
+    streamConnected = false;
   }
 
   return {
     start,
     stop,
-    refresh,
+    sendRemoteKey,
     currentCecByte: () => cecByte,
+    isStreamConnected: () => streamConnected,
   };
 }
 
